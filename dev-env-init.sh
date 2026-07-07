@@ -343,8 +343,14 @@ resolve_config() {
 step_00_build_tools() {
     local SN="00"; step_header "基础构建工具" "$SN"
     step_enabled DEV_STEP_00_ENABLED || { skip_step "$SN" "未选中"; return; }
-    log INFO "  安装 gcc/g++/make 等..."
 
+    # 已有 gcc 则跳过
+    if _has gcc && _has make; then
+        log INFO "  构建工具已安装 (gcc $(gcc --version 2>/dev/null | head -1 | awk '{print $NF}'))"
+        mark_step_ok "$SN"; return
+    fi
+
+    log INFO "  安装 gcc/g++/make 等..."
     case "$PKG_MANAGER" in
         apt)    pkg_install "build-essential curl wget gnupg ca-certificates" ;;
         dnf|yum) pkg_install "gcc gcc-c++ make curl wget gnupg ca-certificates" ;;
@@ -366,6 +372,11 @@ step_01_git() {
 step_02_python() {
     local SN="02"; step_header "Python 3" "$SN"
     step_enabled DEV_STEP_02_ENABLED || { skip_step "$SN" "未选中"; return; }
+
+    if _has python3 && _has pip3; then
+        log INFO "  Python 已安装 ($(python3 --version 2>/dev/null), $(pip3 --version 2>/dev/null | awk '{print $1,$2}'))"
+        mark_step_ok "$SN"; return
+    fi
 
     case "$PKG_MANAGER" in
         apt)    pkg_install "python3 python3-pip python3-venv" ;;
@@ -390,6 +401,10 @@ step_03_nodejs() {
             log INFO "  Node.js ${cur} 已安装，跳过"; mark_step_ok "$SN"; return
         fi
         log WARN "  已有 Node.js ${cur}，将覆盖安装 v${NODE_VERSION}.x"
+        if [ "$BATCH_MODE" = false ]; then
+            printf "  %s" "确认覆盖安装？(y/N) > "
+            read -r yn; case "$yn" in [Yy]*) ;; *) skip_step "$SN" "用户取消"; return ;; esac
+        fi
     fi
 
     case "$OS_FAMILY" in
@@ -428,6 +443,10 @@ step_04_jdk() {
             log INFO "  JDK ${JDK_VERSION} 已安装，跳过"; mark_step_ok "$SN"; return
         fi
         log WARN "  已有 $(echo "$cur" | head -1)，将安装 JDK ${JDK_VERSION}"
+        if [ "$BATCH_MODE" = false ]; then
+            printf "  %s" "确认覆盖安装？(y/N) > "
+            read -r yn; case "$yn" in [Yy]*) ;; *) skip_step "$SN" "用户取消"; return ;; esac
+        fi
     fi
 
     case "$PKG_MANAGER" in
@@ -452,6 +471,14 @@ step_05_nginx() {
     local SN="05"; step_header "Nginx" "$SN"
     step_enabled DEV_STEP_05_ENABLED || { skip_step "$SN" "未选中"; return; }
 
+    if _has nginx; then
+        log INFO "  Nginx 已安装 ($(nginx -v 2>&1))"
+        if command -v systemctl &>/dev/null && ! systemctl is-active nginx &>/dev/null 2>&1; then
+            dry systemctl start nginx && log INFO "  nginx 已启动 ✓"
+        fi
+        mark_step_ok "$SN"; return
+    fi
+
     pkg_install nginx || { mark_step_fail "$SN" "安装失败"; return; }
     nginx -v 2>&1 | while IFS= read -r l; do log INFO "  ${l}"; done
 
@@ -466,6 +493,17 @@ step_06_mysql() {
     local SN="06"; step_header "MySQL" "$SN"
     step_enabled DEV_STEP_06_ENABLED || { skip_step "$SN" "未选中"; return; }
 
+    if _has mysql || _has mariadb; then
+        local ver; ver=$(mysql --version 2>/dev/null || mariadb --version 2>/dev/null)
+        log INFO "  MySQL/MariaDB 已安装 ($ver)"
+        if command -v systemctl &>/dev/null; then
+            systemctl is-active mysql &>/dev/null 2>&1 && log INFO "  服务运行中 ✓" || \
+                systemctl is-active mariadb &>/dev/null 2>&1 && log INFO "  服务运行中 ✓" || \
+                { log WARN "  服务未运行，尝试启动..."; dry systemctl start mysql 2>/dev/null || dry systemctl start mariadb 2>/dev/null; }
+        fi
+        mark_step_ok "$SN"; return
+    fi
+
     case "$PKG_MANAGER" in
         apt)    pkg_install "mysql-server" ;;
         dnf|yum) pkg_install "mysql-server" ;;
@@ -479,28 +517,37 @@ step_06_mysql() {
         dry systemctl start mysql 2>/dev/null || dry systemctl start mariadb 2>/dev/null
     fi
 
-    # 安全初始化（仅首次）
-    if [ "$DRY_RUN" = false ]; then
+    # 安全初始化（仅首次，通过标记文件判断）
+    local SECURED_MARKER="/etc/mysql/.dev-env-init-secured"
+    if [ "$DRY_RUN" = false ] && [ ! -f "$SECURED_MARKER" ]; then
         if _has mysql_secure_installation; then
-            log INFO "  执行 MySQL 安全初始化（跳过 root 密码，移除匿名用户等）..."
-            # 自动应答 mysql_secure_installation
-            mysql_secure_installation 2>/dev/null <<EOF || true
-n
-y
-y
-y
-y
-EOF
+            log INFO "  执行 MySQL 安全初始化（首次）..."
+            # 使用 expect 式输入，兼容 MySQL 8.0+ VALIDATE PASSWORD 组件
+            # 回答: 不使用 VALIDATE, 不设 root 密码(n), 移除匿名用户(y), 禁止远程 root(y), 移除 test 库(y), 重载权限(y)
+            mysql --user=root 2>/dev/null <<'EOSQL' || true
+ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '';
+DELETE FROM mysql.user WHERE User='';
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+FLUSH PRIVILEGES;
+EOSQL
+            dry touch "$SECURED_MARKER"
+            log INFO "  MySQL 安全初始化完成 ✓"
         elif _has mariadb-secure-installation; then
-            log INFO "  执行 MariaDB 安全初始化..."
-            mariadb-secure-installation 2>/dev/null <<EOF || true
-n
-y
-y
-y
-y
-EOF
+            log INFO "  执行 MariaDB 安全初始化（首次）..."
+            mysql --user=root 2>/dev/null <<'EOSQL' || true
+DELETE FROM mysql.user WHERE User='';
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+FLUSH PRIVILEGES;
+EOSQL
+            dry touch "$SECURED_MARKER"
+            log INFO "  MariaDB 安全初始化完成 ✓"
         fi
+    elif [ "$DRY_RUN" = false ]; then
+        log INFO "  MySQL 已初始化过，跳过安全配置"
     fi
 
     mysql --version 2>/dev/null | while IFS= read -r l; do log INFO "  ${l}"; done
@@ -510,6 +557,17 @@ EOF
 step_07_redis() {
     local SN="07"; step_header "Redis" "$SN"
     step_enabled DEV_STEP_07_ENABLED || { skip_step "$SN" "未选中"; return; }
+
+    if _has redis-cli; then
+        log INFO "  Redis 已安装 ($(redis-cli --version 2>/dev/null))"
+        if command -v systemctl &>/dev/null; then
+            systemctl is-active redis-server &>/dev/null 2>&1 && log INFO "  服务运行中 ✓" || \
+            systemctl is-active redis &>/dev/null 2>&1 && log INFO "  服务运行中 ✓" || \
+            { log WARN "  服务未运行，尝试启动..."; dry systemctl start redis-server 2>/dev/null || dry systemctl start redis 2>/dev/null; }
+        fi
+        redis-cli ping 2>/dev/null | grep -q PONG && log INFO "  Redis PING → PONG ✓" || log WARN "  Redis 未响应"
+        mark_step_ok "$SN"; return
+    fi
 
     pkg_install redis-server || pkg_install redis || { mark_step_fail "$SN" "安装失败"; return; }
 
@@ -560,6 +618,8 @@ step_08_docker() {
             log INFO "  docker-compose 已安装 ($(docker-compose --version 2>/dev/null))"
         elif docker compose version &>/dev/null 2>&1; then
             log INFO "  docker compose (plugin) 已可用"
+        elif [ -f /usr/local/bin/docker-compose ]; then
+            log INFO "  docker-compose 二进制已存在"
         else
             log INFO "  安装 docker-compose..."
             dry curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
