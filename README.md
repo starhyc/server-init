@@ -95,3 +95,50 @@ SSH_PORT=2222 ADMIN_USER=ops sudo -E bash secure-server-init.sh
 ## 日志
 
 执行日志保存在 `/var/log/secure-server-init-*.log`，每次运行独立文件。
+
+---
+
+# dev-env-init
+
+安全加固完成后，一键安装开发环境：JDK、Python、Node.js、Nginx、MySQL、Redis、Docker 等。
+
+## 一行命令
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/starhyc/server-init/main/dev-env-init.sh | sudo bash
+```
+
+## 支持工具
+
+| 工具 | 说明 |
+|------|------|
+| 基础构建工具 | gcc / g++ / make / curl / wget 等 |
+| Git | 版本控制 |
+| Python 3 | Python + pip + venv |
+| Node.js | LTS 版本，通过 NodeSource 源安装 |
+| JDK | OpenJDK，可选 8 / 11 / 17 / 21 |
+| Nginx | 高性能 Web 服务器，安装后自动启动 |
+| MySQL | MySQL Server，自动执行安全初始化 |
+| Redis | 内存缓存，安装后验证 PING |
+| Docker | 容器运行时 + docker-compose |
+
+## 使用方式
+
+```bash
+# 交互菜单（方向键选择）
+sudo bash dev-env-init.sh
+
+# 批量安装
+bash dev-env-init.sh --generate-config > my.conf
+sudo bash dev-env-init.sh --config my.conf
+```
+
+## 推荐顺序
+
+```bash
+# 1. 安全加固
+curl -fsSL https://raw.githubusercontent.com/starhyc/server-init/main/secure-server-init.sh | sudo bash
+
+# 2. 开发环境
+curl -fsSL https://raw.githubusercontent.com/starhyc/server-init/main/dev-env-init.sh | sudo bash
+```
