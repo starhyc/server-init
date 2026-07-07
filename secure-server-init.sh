@@ -147,109 +147,146 @@ pkg_update() {
 #  交 互 式 菜 单 引 擎
 # ══════════════════════════════════════════════════════════════════════════════
 
-# 绘制步骤选择菜单，返回用户勾选的步骤 ID 列表（空格分隔）
+# ── 单键读取（支持方向键） ──────────────────────────────────────────────────
+
+# 在 stty raw 下读取一个逻辑按键，返回:
+#   UP / DOWN / SPACE / ENTER / q
+_read_key() {
+    local k
+    IFS= read -r -n 1 k
+    if [ "$k" = $'\033' ]; then
+        # 方向键转义序列: \033[A (up), \033[B (down)
+        local k2; IFS= read -r -n 1 -t 0.05 k2
+        if [ "$k2" = "[" ]; then
+            local k3; IFS= read -r -n 1 -t 0.05 k3
+            case "$k3" in
+                A) echo "UP"    ;;
+                B) echo "DOWN"  ;;
+            esac
+        fi
+    elif [ "$k" = " " ]; then
+        echo "SPACE"
+    elif [ "$k" = $'\n' ] || [ "$k" = "" ]; then
+        echo "ENTER"
+    elif [ "$k" = "q" ] || [ "$k" = "Q" ]; then
+        echo "QUIT"
+    fi
+}
+
+# 在 raw 模式下渲染菜单；cursor 是当前高亮行号 (0-based)
+_render_menu() {
+    local cursor="$1"; shift
+    local selected=("$@")
+    local n=${#STEPS[@]}
+
+    printf '\033[H\033[J'  # 清屏
+    echo ""
+    echo -e "${C_B}${C_CYN}  ╔══════════════════════════════════════════════════════╗${C_R}"
+    echo -e "${C_B}${C_CYN}  ║      服务器安全初始化 — 选择要执行的安全措施        ║${C_R}"
+    echo -e "${C_B}${C_CYN}  ╚══════════════════════════════════════════════════════╝${C_R}"
+    echo ""
+    echo -e "  系统: ${C_GRN}${OS_PRETTY}${C_R}"
+    echo -e "  包管理: ${PKG_MANAGER}    防火墙工具: ${FIREWALL_TOOL}"
+    echo ""
+    printf "  %s\n" "  ↑↓ 移动    Space 勾选/取消    Enter 确认    Q 退出"
+    echo ""
+
+    local row=0
+    for entry in "${STEPS[@]}"; do
+        IFS='|' read -r id _ label desc <<< "$entry"
+
+        local mark=" "; for s in "${selected[@]}"; do [ "$s" = "$id" ] && mark="x"; done
+        local check=""; [ "$mark" = "x" ] && check="${C_GRN}" || check="${C_BLU}"
+        local hl=""; [ "$row" -eq "$cursor" ] && hl="${C_B}${C_CYN}"
+
+        if [ "$row" -eq "$cursor" ]; then
+            printf "  ${hl}▸ [${mark}] %s${C_R}\n" "$label"
+        else
+            printf "  ${check}   [${mark}] %s${C_R}\n" "$label"
+        fi
+        printf "        %s\n" "$desc"
+        ((row++))
+    done
+
+    echo ""
+    printf "  ${C_YEL}已选:${C_R}"
+    local sel=()
+    for entry in "${STEPS[@]}"; do
+        IFS='|' read -r id _ label _ <<< "$entry"
+        for s in "${selected[@]}"; do [ "$s" = "$id" ] && sel+=("$label"); done
+    done
+    [ ${#sel[@]} -eq 0 ] && printf " (无)" || printf " %s" "${sel[@]}"
+    echo ""
+}
+
+# 使用方向键 + 空格选择步骤
 menu_select_steps() {
     local selected=()
-    # 初始化：默认全选
     for entry in "${STEPS[@]}"; do
         IFS='|' read -r id _ _ _ <<< "$entry"
         selected+=("$id")
     done
+    local cursor=0
+    local n=${#STEPS[@]}
+
+    # 进入 raw 模式
+    local tty_settings; tty_settings=$(stty -g 2>/dev/null)
+    stty -echo -icanon min 0 time 0 2>/dev/null
+
+    # 确保退出时恢复终端
+    trap 'stty "$tty_settings" 2>/dev/null; printf "\033[?25h"' EXIT
+
+    printf '\033[?25l'  # 隐藏光标
+    _render_menu "$cursor" "${selected[@]}"
 
     while true; do
-        clear 2>/dev/null || printf '\033[2J\033[H'
-        echo ""
-        echo -e "${C_B}${C_CYN}  ╔══════════════════════════════════════════════════════╗${C_R}"
-        echo -e "${C_B}${C_CYN}  ║      服务器安全初始化 — 选择要执行的安全措施        ║${C_R}"
-        echo -e "${C_B}${C_CYN}  ╚══════════════════════════════════════════════════════╝${C_R}"
-        echo ""
-        echo -e "  系统: ${C_GRN}${OS_PRETTY}${C_R}"
-        echo -e "  包管理: ${PKG_MANAGER}    防火墙工具: ${FIREWALL_TOOL}"
-        echo ""
-        echo -e "  ${C_B}输入编号切换选中/取消，输完按 Enter 继续:${C_R}"
-        echo ""
-
-        local idx=1
-        for entry in "${STEPS[@]}"; do
-            IFS='|' read -r id _ label desc <<< "$entry"
-            local mark=" "
-            for s in "${selected[@]}"; do [ "$s" = "$id" ] && mark="x"; done
-            if [ "$mark" = "x" ]; then
-                printf "  ${C_GRN}[%s]${C_R} %2d. %s\n" "$mark" "$idx" "$label"
-            else
-                printf "  ${C_BLU}[%s]${C_R} %2d. %s\n" "$mark" "$idx" "$label"
-            fi
-            printf "       %s\n" "$desc"
-            ((idx++))
-        done
-
-        echo ""
-        printf "  ${C_YEL}当前选中:${C_R}"
-        local sel_labels=()
-        for entry in "${STEPS[@]}"; do
-            IFS='|' read -r id _ label _ <<< "$entry"
-            for s in "${selected[@]}"; do
-                [ "$s" = "$id" ] && sel_labels+=("$label")
-            done
-        done
-        if [ ${#sel_labels[@]} -eq 0 ]; then
-            printf " (无)"
-        else
-            printf " %s" "${sel_labels[@]}"
-        fi
-        echo ""
-        echo ""
-
-        printf "  ${C_B}输入编号 (1-%d) 或直接 Enter 开始 > ${C_R}" "${#STEPS[@]}"
-        read -r input
-
-        # 空输入 = 确认选择
-        if [ -z "$input" ]; then
-            break
-        fi
-
-        # 解析输入：支持 "1 3 5" 空格分隔多个编号
-        for token in $input; do
-            case "$token" in
-                [1-9]|[1-9][0-9])
-                    if [ "$token" -ge 1 ] 2>/dev/null && [ "$token" -le "${#STEPS[@]}" ]; then
-                        local target_id=""
-                        local i=1
-                        for entry in "${STEPS[@]}"; do
-                            IFS='|' read -r id _ _ _ <<< "$entry"
-                            [ "$i" -eq "$token" ] && target_id="$id" && break
-                            ((i++))
-                        done
-                        # toggle
-                        local found=false
-                        local new_selected=()
-                        for s in "${selected[@]}"; do
-                            if [ "$s" = "$target_id" ]; then
-                                found=true
-                            else
-                                new_selected+=("$s")
-                            fi
-                        done
-                        if [ "$found" = false ]; then
-                            new_selected+=("$target_id")
-                        fi
-                        selected=("${new_selected[@]}")
-                    fi
-                    ;;
-            esac
-        done
+        local key; key=$(_read_key)
+        case "$key" in
+            UP)
+                [ "$cursor" -gt 0 ] && ((cursor--))
+                _render_menu "$cursor" "${selected[@]}"
+                ;;
+            DOWN)
+                [ "$cursor" -lt $((n - 1)) ] && ((cursor++))
+                _render_menu "$cursor" "${selected[@]}"
+                ;;
+            SPACE)
+                local target_id=""; local i=0
+                for entry in "${STEPS[@]}"; do
+                    IFS='|' read -r id _ _ _ <<< "$entry"
+                    [ "$i" -eq "$cursor" ] && target_id="$id" && break
+                    ((i++))
+                done
+                local found=false
+                local new_sel=()
+                for s in "${selected[@]}"; do
+                    [ "$s" = "$target_id" ] && found=true || new_sel+=("$s")
+                done
+                [ "$found" = false ] && new_sel+=("$target_id")
+                selected=("${new_sel[@]}")
+                _render_menu "$cursor" "${selected[@]}"
+                ;;
+            ENTER)
+                break
+                ;;
+            QUIT)
+                selected=()
+                break
+                ;;
+        esac
     done
 
-    # 将 toggle 结果写入对应变量
+    trap - EXIT
+    stty "$tty_settings" 2>/dev/null
+    printf '\033[?25h'  # 恢复光标
+
+    # 写入变量
     for entry in "${STEPS[@]}"; do
         IFS='|' read -r id var _ _ <<< "$entry"
         local enabled=false
-        for s in "${selected[@]}"; do
-            [ "$s" = "$id" ] && enabled=true
-        done
+        for s in "${selected[@]}"; do [ "$s" = "$id" ] && enabled=true; done
         eval "${var}=${enabled}"
     done
-
     STEP_IDS="${selected[*]}"
 }
 
@@ -795,6 +832,19 @@ if [ "$BATCH_MODE" = true ]; then
 else
     # ── 交互式菜单模式 ──
     menu_select_steps
+
+    # 检查是否有选中步骤（Q 退出时全部取消）
+    local any_enabled=false
+    for entry in "${STEPS[@]}"; do
+        IFS='|' read -r _ var _ _ <<< "$entry"
+        step_enabled "$var" && any_enabled=true
+    done
+    if [ "$any_enabled" = false ]; then
+        echo ""
+        log WARN "未选择任何安全措施，已退出。"
+        exit 0
+    fi
+
     menu_configure_params
     menu_confirm
 
