@@ -651,7 +651,26 @@ step_03_fail2ban() {
     command -v fail2ban-client &>/dev/null || { mark_step_fail "$SN" "fail2ban 不可用"; return; }
 
     local JAIL="/etc/fail2ban/jail.local"
-    if ! dry grep -q "secure-server-init" "$JAIL" 2>/dev/null; then
+    local NEED_REGEN=false
+
+    if dry grep -q "secure-server-init" "$JAIL" 2>/dev/null; then
+        # 已有配置，但检测是否因日志文件缺失导致失效
+        if grep -q '^backend\s*=\s*auto' "$JAIL" 2>/dev/null; then
+            local old_log; old_log=$(grep '^logpath' "$JAIL" 2>/dev/null | awk '{print $NF}')
+            if [ -n "$old_log" ] && [ ! -f "$old_log" ]; then
+                log WARN "  已有配置引用了不存在的日志文件: ${old_log}"
+                log WARN "  需要重新生成配置以适配当前系统"
+                NEED_REGEN=true
+            fi
+        fi
+        if [ "$NEED_REGEN" = false ]; then
+            log INFO "  jail.local 已配置过，跳过"
+        fi
+    else
+        NEED_REGEN=true
+    fi
+
+    if $NEED_REGEN; then
         # ── 检测日志来源 ──
         local AL="" F2B_BACKEND="auto"
         # 优先检测 syslog 文件
@@ -693,8 +712,6 @@ EOF
             echo "logpath  = ${AL}" >> /tmp/f2b-jail.local
         fi
         dry cp /tmp/f2b-jail.local "$JAIL"
-    else
-        log INFO "  jail.local 已配置过，跳过"
     fi
 
     if command -v systemctl &>/dev/null; then
