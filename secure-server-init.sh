@@ -314,6 +314,15 @@ menu_configure_params() {
     # ── 步骤 02: SSH 加固 ──
     if step_enabled SECURE_STEP_02_ENABLED; then
         echo -e "  ${C_B}▸ SSH 加固${C_R}"
+
+        # 显示当前状态
+        local cur_lvl; cur_lvl=$(_ssh_current_level)
+        case "$cur_lvl" in
+            full)  echo -e "    ${C_GRN}当前状态: 完全加固（密码登录已禁用）${C_R}" ;;
+            basic) echo -e "    ${C_YEL}当前状态: 基础加固（密码登录保留）。上传公钥后重新运行可升级。${C_R}" ;;
+            *)     echo -e "    ${C_BLU}当前状态: 未加固${C_R}" ;;
+        esac
+
         printf "    SSH 端口 [${C_GRN}%s${C_R}]: " "$SSH_PORT"
         read -r input; [ -n "$input" ] && SSH_PORT="$input"
 
@@ -322,12 +331,11 @@ menu_configure_params() {
         if [ -n "$input" ]; then SSH_ALLOW_USERS="$input"; fi
 
         if step_enabled SECURE_STEP_01_ENABLED; then
-            local ak="/home/${ADMIN_USER}/.ssh/authorized_keys"
-            if [ ! -f "$ak" ] || [ ! -s "$ak" ]; then
-                echo -e "    ${C_RED}⚠ ${ADMIN_USER} 尚未配置 SSH 公钥！禁用密码后你将无法登录！${C_R}"
-                echo -e "    ${C_YEL}建议先执行: ssh-copy-id ${ADMIN_USER}@<服务器IP>${C_R}"
+            if _ssh_has_key; then
+                echo -e "    ${C_GRN}✓ authorized_keys 已配置 → 将执行完全加固${C_R}"
             else
-                echo -e "    ${C_GRN}✓ authorized_keys 已配置${C_R}"
+                echo -e "    ${C_YEL}⚠ ${ADMIN_USER} 未配置 SSH 公钥 → 将执行基础加固（保留密码登录）${C_R}"
+                echo -e "    ${C_YEL}  上传公钥后重新运行即可升级: ssh-copy-id ${ADMIN_USER}@<服务器IP>${C_R}"
             fi
         fi
         echo ""
@@ -490,9 +498,30 @@ step_01_user_sudo() {
     mark_step_ok "$SN"
 }
 
+# ── SSH 加固辅助：判断是否有密钥 ────────────────────────────────────────────
+
+_ssh_has_key() {
+    local ak="/home/${ADMIN_USER}/.ssh/authorized_keys"
+    [ -f "$ak" ] && [ -s "$ak" ]
+}
+
+# ── SSH 加固辅助：判断当前加固等级 ──────────────────────────────────────────
+# 返回: "none" (未加固) / "basic" (基础加固, 密码未关) / "full" (完全加固)
+_ssh_current_level() {
+    local c="${1:-/etc/ssh/sshd_config.d/99-secure-init.conf}"
+    if [ ! -f "$c" ]; then echo "none"; return; fi
+    # 检查是否由本脚本生成
+    grep -q "secure-server-init" "$c" 2>/dev/null || { echo "none"; return; }
+    if grep -q "^PasswordAuthentication no$" "$c" 2>/dev/null; then
+        echo "full"
+    else
+        echo "basic"
+    fi
+}
+
 step_02_ssh_harden() {
     local SN="02"
-    step_header "$SN" "SSH 加固（禁用 root/密码登录，仅密钥认证）"
+    step_header "$SN" "SSH 加固"
     step_enabled SECURE_STEP_02_ENABLED || { skip_step "$SN" "未选中"; return; }
 
     if ! command -v sshd &>/dev/null && ! systemctl list-unit-files sshd.service &>/dev/null 2>&1; then
@@ -505,31 +534,67 @@ step_02_ssh_harden() {
 
     local SSHD_CONFIG_D="/etc/ssh/sshd_config.d"
     local OUR_CONFIG="${SSHD_CONFIG_D}/99-secure-init.conf"
-    local BACKUP="${SSHD_CONFIG}.bak-$(date +%Y%m%d-%H%M%S)"
+    local HAS_KEY=false; _ssh_has_key && HAS_KEY=true
+    local LEVEL; LEVEL=$(_ssh_current_level "$OUR_CONFIG")
 
+    # ── 情况 1: 已完全加固 ──
+    if [ "$LEVEL" = "full" ]; then
+        log INFO "  SSH 已完全加固（密码登录已禁用），无需重复操作"
+        if [ "$DRY_RUN" = false ]; then
+            log INFO "  PermitRootLogin = no ✓"
+            log INFO "  PasswordAuthentication = no ✓"
+            log INFO "  PubkeyAuthentication = yes ✓"
+        fi
+        mark_step_ok "$SN"; return
+    fi
+
+    # ── 情况 2: 已基础加固，检测是否可以升级 ──
+    if [ "$LEVEL" = "basic" ]; then
+        log INFO "  检测到现有基础加固（密码登录仍开启）"
+        if $HAS_KEY; then
+            log INFO "  发现 ${ADMIN_USER} 的 SSH 公钥已配置，可升级到完全加固"
+            if [ "$BATCH_MODE" = false ]; then
+                printf "  %s" "是否升级为完全加固（禁用密码登录）？(Y/n) > "
+                read -r yn
+                case "$yn" in [Nn]*) log INFO "  保持基础加固"; mark_step_ok "$SN"; return ;; esac
+            fi
+        else
+            log INFO "  尚未配置 SSH 公钥，保持基础加固（密码登录保留）"
+            log WARN "  上传公钥后重新运行本脚本可自动升级到完全加固"
+            mark_step_ok "$SN"; return
+        fi
+    fi
+
+    # ── 备份 ──
+    local BACKUP="${SSHD_CONFIG}.bak-$(date +%Y%m%d-%H%M%S)"
     log INFO "  备份 sshd_config → ${BACKUP}"
     dry cp "$SSHD_CONFIG" "$BACKUP"
 
-    local AUTH_KEYS="/home/${ADMIN_USER}/.ssh/authorized_keys"
-    if [ ! -f "$AUTH_KEYS" ] || [ ! -s "$AUTH_KEYS" ]; then
-        log WARN "  ⚠ ${ADMIN_USER} 尚未配置 SSH 公钥！"
-        log WARN "  ⚠ 禁用密码登录后你将无法 SSH 登录!"
-        if [ "$BATCH_MODE" = true ]; then
-            skip_step "$SN" "批量模式且未配置公钥（安全保护）"; return
-        fi
-        printf "  %s" "确认继续？(yes/no) [no] > "
-        read -r yn
-        case "$yn" in yes|YES|y|Y) ;; *) skip_step "$SN" "用户取消"; return ;; esac
+    # ── 决定加固等级 ──
+    local PASSWORD_AUTH="yes"
+    if $HAS_KEY; then
+        log INFO "  authorized_keys 已配置 ✓ → 完全加固模式"
+        PASSWORD_AUTH="no"
     else
-        log INFO "  authorized_keys 已配置 ✓"
+        log WARN "  ⚠ ${ADMIN_USER} 未配置 SSH 公钥 → 基础加固模式（保留密码登录）"
+        log WARN "  ⚠ 上传公钥后重新运行本脚本即可升级到完全加固"
+        if [ "$BATCH_MODE" = true ]; then
+            log INFO "  批量模式: 执行基础加固"
+        else
+            printf "  %s" "确认执行基础加固？(Y/n) > "
+            read -r yn
+            case "$yn" in [Nn]*) skip_step "$SN" "用户取消"; return ;; esac
+        fi
     fi
 
+    # ── 生成配置 ──
     dry mkdir -p "$SSHD_CONFIG_D"
     cat > /tmp/sshd-secure-init.tmp <<EOF
 # 由 secure-server-init.sh 自动生成 — $(date)
+# 加固等级: $([ "$PASSWORD_AUTH" = "no" ] && echo "完全" || echo "基础")
 # 原始配置备份: ${BACKUP}
 PermitRootLogin no
-PasswordAuthentication no
+PasswordAuthentication ${PASSWORD_AUTH}
 PubkeyAuthentication yes
 PermitEmptyPasswords no
 ChallengeResponseAuthentication no
@@ -545,10 +610,12 @@ EOF
     dry cp /tmp/sshd-secure-init.tmp "$OUR_CONFIG"
     dry chmod 600 "$OUR_CONFIG"
 
+    # ── 语法检查 → 重启 ──
     log INFO "  检查 sshd 配置语法..."
     if ! dry sshd -t; then
         log ERROR "  sshd 配置语法错误！正在恢复备份..."
         dry cp "$BACKUP" "$SSHD_CONFIG"
+        rm -f "$OUR_CONFIG"
         mark_step_fail "$SN" "配置语法错误，已恢复备份"; return
     fi
 
@@ -558,10 +625,15 @@ EOF
         dry service sshd restart || dry service ssh restart
     fi
 
+    # ── 后置检查 ──
     local ok=true
-    sshd -T 2>/dev/null | grep -q '^permitrootlogin no$'      && log INFO "  PermitRootLogin = no ✓"       || { log WARN "  PermitRootLogin 未通过"; ok=false; }
-    sshd -T 2>/dev/null | grep -q '^passwordauthentication no$' && log INFO "  PasswordAuthentication = no ✓" || { log WARN "  PasswordAuthentication 未通过"; ok=false; }
-    sshd -T 2>/dev/null | grep -q '^pubkeyauthentication yes$' && log INFO "  PubkeyAuthentication = yes ✓"  || { log WARN "  PubkeyAuthentication 未通过"; ok=false; }
+    sshd -T 2>/dev/null | grep -q '^permitrootlogin no$'       && log INFO "  PermitRootLogin = no ✓"         || { log WARN "  PermitRootLogin 未通过"; ok=false; }
+    sshd -T 2>/dev/null | grep -q '^pubkeyauthentication yes$' && log INFO "  PubkeyAuthentication = yes ✓"   || { log WARN "  PubkeyAuthentication 未通过"; ok=false; }
+    if [ "$PASSWORD_AUTH" = "no" ]; then
+        sshd -T 2>/dev/null | grep -q '^passwordauthentication no$' && log INFO "  PasswordAuthentication = no ✓" || { log WARN "  PasswordAuthentication 未通过"; ok=false; }
+    else
+        log INFO "  PasswordAuthentication = yes (基础模式，密码登录保留)"
+    fi
     [ "$ok" = false ] && log WARN "  部分配置可能未生效，请手动检查"
 
     mark_step_ok "$SN"
@@ -625,6 +697,36 @@ step_04_firewall() {
     case "$FIREWALL_TOOL" in
         ufw)
             command -v ufw &>/dev/null || pkg_install ufw || { mark_step_fail "$SN" "ufw 安装失败"; return; }
+
+            # 检查是否已激活：已激活则只补充端口，不 reset
+            # (状态检查始终真实执行，不受 dry-run 影响)
+            if ufw status 2>/dev/null | grep -q "^Status: active"; then
+                log INFO "  ufw 已处于激活状态，仅补充缺失端口..."
+
+                if ! ufw status 2>/dev/null | grep -q "${SSH_PORT}/tcp"; then
+                    dry ufw allow "${SSH_PORT}/tcp" comment "SSH"
+                    log INFO "    已添加 SSH 端口 ${SSH_PORT}/tcp"
+                else
+                    log INFO "    SSH 端口 ${SSH_PORT}/tcp 已开放"
+                fi
+
+                for e in $UFW_PORTS; do
+                    local p="${e%/*}" proto="${e##*/}"
+                    [ "$e" = "${SSH_PORT}/tcp" ] && continue
+                    if ! ufw status 2>/dev/null | grep -q "${p}/${proto}"; then
+                        dry ufw allow "$e" 2>/dev/null || log WARN "    端口 ${e} 添加失败"
+                        log INFO "    已添加端口 ${e}"
+                    else
+                        log INFO "    端口 ${e} 已开放"
+                    fi
+                done
+
+                log INFO "  防火墙状态:"
+                ufw status numbered 2>/dev/null | while IFS= read -r l; do log INFO "    ${l}"; done
+                mark_step_ok "$SN"; return
+            fi
+
+            # 首次配置：完整初始化
             dry ufw --force reset
             dry ufw default deny incoming
             dry ufw default allow outgoing
@@ -635,11 +737,35 @@ step_04_firewall() {
             echo "y" | dry ufw enable
             dry ufw status verbose 2>/dev/null | while IFS= read -r l; do log INFO "    ${l}"; done
             ;;
+
         firewalld)
             command -v firewall-cmd &>/dev/null || {
                 pkg_install firewalld || { mark_step_fail "$SN" "firewalld 安装失败"; return; }
                 command -v systemctl &>/dev/null && dry systemctl enable --now firewalld
             }
+
+            # 检查是否已运行：已运行则只补充端口
+            # (状态检查始终真实执行)
+            if firewall-cmd --state &>/dev/null 2>&1; then
+                log INFO "  firewalld 已运行，仅补充缺失端口..."
+                local cur_ports; cur_ports=$(firewall-cmd --list-ports 2>/dev/null)
+                for e in $UFW_PORTS; do
+                    if ! echo "$cur_ports" | grep -qw "$e"; then
+                        dry firewall-cmd --permanent --add-port="$e" 2>/dev/null || true
+                        log INFO "    已添加端口 ${e}"
+                    else
+                        log INFO "    端口 ${e} 已开放"
+                    fi
+                done
+                if ! echo "$cur_ports" | grep -qw "${SSH_PORT}/tcp"; then
+                    dry firewall-cmd --permanent --add-port="${SSH_PORT}/tcp" 2>/dev/null
+                fi
+                dry firewall-cmd --reload
+                dry firewall-cmd --list-all 2>/dev/null | while IFS= read -r l; do log INFO "    ${l}"; done
+                mark_step_ok "$SN"; return
+            fi
+
+            # 首次配置
             dry firewall-cmd --set-default-zone=public
             for e in $UFW_PORTS; do
                 dry firewall-cmd --permanent --add-port="$e" 2>/dev/null || true
@@ -648,7 +774,15 @@ step_04_firewall() {
             dry firewall-cmd --reload
             dry firewall-cmd --list-all 2>/dev/null | while IFS= read -r l; do log INFO "    ${l}"; done
             ;;
+
         iptables)
+            # iptables 检查是否已有规则 (状态检查始终真实执行)
+            if iptables -L INPUT -n 2>/dev/null | grep -q "DROP\|REJECT"; then
+                log INFO "  iptables 已有规则，跳过自动配置，请手动检查"
+                iptables -L INPUT -n --line-numbers 2>/dev/null | while IFS= read -r l; do log INFO "    ${l}"; done
+                mark_step_ok "$SN"; return
+            fi
+
             log WARN "  Arch 系 — 将应用以下 iptables 规则:"
             log WARN "    iptables -P INPUT DROP"
             log WARN "    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT"
