@@ -652,7 +652,26 @@ step_03_fail2ban() {
 
     local JAIL="/etc/fail2ban/jail.local"
     if ! dry grep -q "secure-server-init" "$JAIL" 2>/dev/null; then
-        local AL="/var/log/auth.log"; [ -f "$AL" ] || AL="/var/log/secure"
+        # ── 检测日志来源 ──
+        local AL="" F2B_BACKEND="auto"
+        # 优先检测 syslog 文件
+        if [ -f "/var/log/auth.log" ]; then
+            AL="/var/log/auth.log"
+        elif [ -f "/var/log/secure" ]; then
+            AL="/var/log/secure"
+        fi
+
+        # 无 syslog 文件 → 使用 systemd-journald
+        if [ -z "$AL" ] && command -v journalctl &>/dev/null; then
+            F2B_BACKEND="systemd"
+            log INFO "  未检测到 syslog 日志文件，使用 systemd-journald 后端"
+        elif [ -z "$AL" ]; then
+            log WARN "  未找到 SSH 日志来源，fail2ban 配置可能不完整"
+            AL="/var/log/auth.log"  # 回退默认值
+        else
+            log INFO "  日志文件: ${AL}"
+        fi
+
         dry mkdir -p /etc/fail2ban
         cat > /tmp/f2b-jail.local <<EOF
 # 由 secure-server-init.sh 自动生成 — $(date)
@@ -661,15 +680,18 @@ bantime  = ${FAIL2BAN_BANTIME}
 findtime = ${FAIL2BAN_FINDTIME}
 maxretry = ${FAIL2BAN_MAXRETRY}
 ignoreip = 127.0.0.1/8 ::1
-backend  = auto
+backend  = ${F2B_BACKEND}
 banaction = iptables-multiport
 [sshd]
 enabled  = true
 port     = ${SSH_PORT}
-logpath  = ${AL}
 mode     = aggressive
 maxretry = ${FAIL2BAN_MAXRETRY}
 EOF
+        # systemd 后端不需要 logpath，auto 后端需要
+        if [ "$F2B_BACKEND" != "systemd" ]; then
+            echo "logpath  = ${AL}" >> /tmp/f2b-jail.local
+        fi
         dry cp /tmp/f2b-jail.local "$JAIL"
     else
         log INFO "  jail.local 已配置过，跳过"
