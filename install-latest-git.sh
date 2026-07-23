@@ -145,21 +145,21 @@ _install_all_pkgs() {
             dry apt-get update -y
             dry apt-get install -y \
                 build-essential libssl-dev libcurl4-openssl-dev \
-                libexpat1-dev zlib1g-dev gettext
+                libexpat1-dev zlib1g-dev gettext cargo
             ;;
         dnf|yum)
             dry "$PKG_MGR" install -y \
                 gcc make curl-devel expat-devel gettext-devel \
-                openssl-devel zlib-devel perl-ExtUtils-MakeMaker
+                openssl-devel zlib-devel perl-ExtUtils-MakeMaker cargo
             ;;
         zypper)
             dry zypper install -y \
                 gcc make libcurl-devel libexpat-devel gettext-tools \
-                libopenssl-devel zlib-devel
+                libopenssl-devel zlib-devel cargo
             ;;
         pacman)
             dry pacman -S --noconfirm \
-                base-devel openssl curl expat
+                base-devel openssl curl expat rust
             ;;
     esac
 }
@@ -333,7 +333,15 @@ else
 
     # 使用 CPU 核心数并行编译
     CPU_COUNT=$(nproc 2>/dev/null || echo 1)
-    make -j"$CPU_COUNT" 2>&1 | while IFS= read -r l; do
+
+    # 检测 Rust 工具链是否可用（Git 2.46+ 包含 Rust 组件）
+    MAKE_RUST_FLAGS=""
+    if ! command -v cargo &>/dev/null || ! command -v rustc &>/dev/null; then
+        log WARN "cargo/rustc 不可用，跳过 Rust 组件编译"
+        MAKE_RUST_FLAGS="NO_RUST=1"
+    fi
+
+    make -j"$CPU_COUNT" $MAKE_RUST_FLAGS 2>&1 | while IFS= read -r l; do
         # 仅打印关键输出，减少日志量
         case "$l" in
             *error*|*Error*) log ERROR "  ${l}" ;;
