@@ -19,7 +19,10 @@ set -o pipefail
 SCRIPT_NAME="$(basename "$0")"
 DRY_RUN=false
 FORCE=false
+BATCH_MODE=false
 DOCKER_USER="${SUDO_USER:-}"
+CREATE_DOCKER_USER=false
+DOCKER_NEW_USER="docker"
 
 # ── 颜色 ─────────────────────────────────────────────────────────────────────
 
@@ -51,15 +54,17 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run)    DRY_RUN=true; shift ;;
         --force)      FORCE=true; shift ;;
+        --batch)      BATCH_MODE=true; shift ;;
         --user)       DOCKER_USER="$2"; shift 2 ;;
         -h|--help)
             cat <<EOF
 用法: sudo bash $SCRIPT_NAME [选项]
 
-无参数       安装最新 Docker Engine + Compose（已安装则跳过）
+无参数       交互式安装（会提示用户/用户组等配置）
+--batch      非交互模式，使用默认值或 --user 指定用户
 --dry-run    预览模式，仅显示操作不执行
 --force      强制重新安装（剥离旧版本后重装）
---user NAME  将指定用户加入 docker 组（默认: sudo 调用者）
+--user NAME  将指定用户加入 docker 组
 -h, --help   显示此帮助
 
 安装内容:
@@ -121,6 +126,57 @@ if [ "$FORCE" != true ] && command -v docker &>/dev/null; then
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  交互式配置
+# ══════════════════════════════════════════════════════════════════════════════
+
+if [ "$BATCH_MODE" = false ] && [ "$DRY_RUN" = false ] && [ -t 0 ]; then
+    echo ""
+    log STEP "── 用户配置..."
+
+    # ── 问题 1: 是否创建 docker 专属用户 ──
+    if [ -z "$DOCKER_USER" ] || [ "$DOCKER_USER" = "root" ]; then
+        printf "  ${C_B}是否创建专用的 docker 管理用户？ (y/N) [N] > ${C_R}"
+        read -r create_yn
+        case "$create_yn" in
+            y|Y|yes|YES)
+                CREATE_DOCKER_USER=true
+                printf "  ${C_B}用户名 [docker] > ${C_R}"
+                read -r newuser
+                [ -n "$newuser" ] && DOCKER_NEW_USER="$newuser"
+
+                # 创建用户
+                if id "$DOCKER_NEW_USER" &>/dev/null 2>&1; then
+                    log WARN "用户 '${DOCKER_NEW_USER}' 已存在，将仅加入 docker 组"
+                    DOCKER_USER="$DOCKER_NEW_USER"
+                else
+                    useradd -m -s /bin/bash "$DOCKER_NEW_USER" && \
+                        log INFO "用户 '${DOCKER_NEW_USER}' 已创建 ✓"
+                    log WARN "请为用户 '${DOCKER_NEW_USER}' 设置密码:"
+                    passwd "$DOCKER_NEW_USER" || log WARN "密码设置被跳过"
+                    DOCKER_USER="$DOCKER_NEW_USER"
+                fi
+                ;;
+            *)  ;;
+        esac
+    fi
+
+    # ── 问题 2: sudo 调用者是否加入 docker 组 ──
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        # 如果已通过 --user 指定了不同于 SUDO_USER 的用户，不再追加
+        if [ "$DOCKER_USER" = "$SUDO_USER" ] || [ -z "$DOCKER_USER" ]; then
+            printf "  ${C_B}将当前用户 '${SUDO_USER}' 加入 docker 组？ (Y/n) [Y] > ${C_R}"
+            read -r add_yn
+            case "$add_yn" in
+                n|N|no|NO) ;;
+                *) DOCKER_USER="$SUDO_USER" ;;
+            esac
+        fi
+    fi
+
+    echo ""
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  安装（按发行版）
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -160,7 +216,7 @@ case "$OS_ID" in
         dry install -m 0755 -d /etc/apt/keyrings
         gpg_url="https://download.docker.com/linux/${OS_ID}/gpg"
         if [ "$DRY_RUN" = false ]; then
-            curl -fsSL "$gpg_url" -o /etc/apt/keyrings/docker.asc
+            curl -fsSL "$gpg_url" -o /etc/apt/keyrings/docker.asc || die "Docker GPG 密钥下载失败"
             chmod a+r /etc/apt/keyrings/docker.asc
         else
             log WARN "[DRY] curl -fsSL $gpg_url"
