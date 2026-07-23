@@ -64,6 +64,8 @@ while [ $# -gt 0 ]; do
   uv       → /usr/local/bin/uv
   python3  → /usr/local/bin/python3 → uv 托管 Python
   python   → /usr/local/bin/python  → /usr/local/bin/python3
+  pip3     → /usr/local/bin/pip3    → uv 托管 Python 自带 pip
+  pip      → /usr/local/bin/pip     → /usr/local/bin/pip3
 EOF
             exit 0
             ;;
@@ -202,7 +204,7 @@ fi
 #  步骤 3: 创建 python3 / python 软链接
 # ══════════════════════════════════════════════════════════════════════════════
 
-log STEP "── 创建 python3 / python 系统链接..."
+log STEP "── 创建 python3 / python / pip3 / pip 系统链接..."
 
 if [ "$DRY_RUN" = true ]; then
     log WARN "[DRY] 跳过软链接创建"
@@ -211,6 +213,28 @@ else
     dry ln -sf /usr/local/bin/python3 /usr/local/bin/python
     log INFO "  /usr/local/bin/python3 → ${PYTHON_PATH}"
     log INFO "  /usr/local/bin/python  → /usr/local/bin/python3"
+
+    # pip3 和 python3 在 uv 托管的同一目录中
+    PYTHON_BIN_DIR=$(dirname "$PYTHON_PATH")
+    PIP3_PATH="${PYTHON_BIN_DIR}/pip3"
+    if [ -x "$PIP3_PATH" ]; then
+        dry ln -sf "$PIP3_PATH" /usr/local/bin/pip3
+        dry ln -sf /usr/local/bin/pip3 /usr/local/bin/pip
+        log INFO "  /usr/local/bin/pip3    → ${PIP3_PATH}"
+        log INFO "  /usr/local/bin/pip     → /usr/local/bin/pip3"
+    else
+        # 部分 Python 构建不带 pip（极少数情况），用 ensurepip 补救
+        log WARN "pip3 未找到，尝试通过 ensurepip 安装..."
+        "$PYTHON_PATH" -m ensurepip --upgrade 2>&1 | while IFS= read -r l; do log INFO "  ${l}"; done || true
+        if [ -x "$PIP3_PATH" ]; then
+            dry ln -sf "$PIP3_PATH" /usr/local/bin/pip3
+            dry ln -sf /usr/local/bin/pip3 /usr/local/bin/pip
+            log INFO "  /usr/local/bin/pip3    → ${PIP3_PATH}"
+            log INFO "  /usr/local/bin/pip     → /usr/local/bin/pip3"
+        else
+            log WARN "pip 安装失败，请使用 'uv pip' 代替"
+        fi
+    fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -232,6 +256,9 @@ else
     if command -v python &>/dev/null; then
         python --version 2>/dev/null | while IFS= read -r l; do log INFO "  python:  ${l}"; done
     fi
+    if command -v pip3 &>/dev/null; then
+        pip3 --version 2>/dev/null | while IFS= read -r l; do log INFO "  pip3:    ${l}"; done
+    fi
 fi
 
 # ── 结果 ─────────────────────────────────────────────────────────────────────
@@ -243,7 +270,8 @@ else
     log STEP "安装完成！"
     echo ""
     log INFO "快速开始:"
-    log INFO "  uv python list              # 查看已安装 Python"
-    log INFO "  uv run --python ${PYTHON_VERSION} script.py  # 运行脚本"
+    log INFO "  python3 --version           # 查看 Python 版本"
+    log INFO "  pip3 install <pkg>          # 安装 Python 包"
+    log INFO "  uv pip install <pkg>        # 或使用 uv pip（更快）"
     log INFO "  uv init                     # 创建新项目"
 fi
