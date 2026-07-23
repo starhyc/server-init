@@ -23,6 +23,9 @@ BATCH_MODE=false
 DOCKER_USER="${SUDO_USER:-}"
 CREATE_DOCKER_USER=false
 DOCKER_NEW_USER="docker"
+DOCKER_REGISTRY_MIRROR=""
+# 保存当前 tty，管道执行时从 /dev/tty 读取用户输入
+TTY=/dev/tty; [ -e /dev/tty ] || TTY=/dev/stdin
 
 # ── 颜色 ─────────────────────────────────────────────────────────────────────
 
@@ -129,19 +132,19 @@ fi
 #  交互式配置
 # ══════════════════════════════════════════════════════════════════════════════
 
-if [ "$BATCH_MODE" = false ] && [ "$DRY_RUN" = false ] && [ -t 0 ]; then
+if [ "$BATCH_MODE" = false ] && [ "$DRY_RUN" = false ] && [ -e /dev/tty ]; then
     echo ""
     log STEP "── 用户配置..."
 
     # ── 问题 1: 是否创建 docker 专属用户 ──
     if [ -z "$DOCKER_USER" ] || [ "$DOCKER_USER" = "root" ]; then
         printf "  ${C_B}是否创建专用的 docker 管理用户？ (y/N) [N] > ${C_R}"
-        read -r create_yn
+        read -r create_yn < /dev/tty
         case "$create_yn" in
             y|Y|yes|YES)
                 CREATE_DOCKER_USER=true
                 printf "  ${C_B}用户名 [docker] > ${C_R}"
-                read -r newuser
+                read -r newuser < /dev/tty
                 [ -n "$newuser" ] && DOCKER_NEW_USER="$newuser"
 
                 # 创建用户
@@ -152,7 +155,7 @@ if [ "$BATCH_MODE" = false ] && [ "$DRY_RUN" = false ] && [ -t 0 ]; then
                     useradd -m -s /bin/bash "$DOCKER_NEW_USER" && \
                         log INFO "用户 '${DOCKER_NEW_USER}' 已创建 ✓"
                     log WARN "请为用户 '${DOCKER_NEW_USER}' 设置密码:"
-                    passwd "$DOCKER_NEW_USER" || log WARN "密码设置被跳过"
+                    passwd "$DOCKER_NEW_USER" < /dev/tty || log WARN "密码设置被跳过"
                     DOCKER_USER="$DOCKER_NEW_USER"
                 fi
                 ;;
@@ -162,15 +165,21 @@ if [ "$BATCH_MODE" = false ] && [ "$DRY_RUN" = false ] && [ -t 0 ]; then
 
     # ── 问题 2: sudo 调用者是否加入 docker 组 ──
     if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-        # 如果已通过 --user 指定了不同于 SUDO_USER 的用户，不再追加
         if [ "$DOCKER_USER" = "$SUDO_USER" ] || [ -z "$DOCKER_USER" ]; then
             printf "  ${C_B}将当前用户 '${SUDO_USER}' 加入 docker 组？ (Y/n) [Y] > ${C_R}"
-            read -r add_yn
+            read -r add_yn < /dev/tty
             case "$add_yn" in
                 n|N|no|NO) ;;
                 *) DOCKER_USER="$SUDO_USER" ;;
             esac
         fi
+    fi
+
+    # ── 问题 3: Docker 镜像加速 ──
+    printf "  ${C_B}配置 Docker 镜像加速地址？\n  留空跳过，常用: https://mirror.gcr.io https://docker.m.daocloud.io\n  > ${C_R}"
+    read -r mirror_input < /dev/tty
+    if [ -n "$mirror_input" ]; then
+        DOCKER_REGISTRY_MIRROR="$mirror_input"
     fi
 
     echo ""
@@ -287,6 +296,43 @@ if command -v systemctl &>/dev/null; then
     fi
 else
     dry service docker start 2>/dev/null || true
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  镜像加速
+# ══════════════════════════════════════════════════════════════════════════════
+
+if [ -n "$DOCKER_REGISTRY_MIRROR" ]; then
+    log STEP "── 配置 Docker 镜像加速..."
+
+    if [ "$DRY_RUN" = true ]; then
+        log WARN "[DRY] 写入 /etc/docker/daemon.json"
+    else
+        dry mkdir -p /etc/docker
+
+        # 构建 JSON 数组
+        first=true
+        mirrors_json=""
+        for m in $DOCKER_REGISTRY_MIRROR; do
+            if $first; then
+                mirrors_json="    \"$m\""
+                first=false
+            else
+                mirrors_json="${mirrors_json},\n    \"$m\""
+            fi
+        done
+
+        if [ -f /etc/docker/daemon.json ]; then
+            cp /etc/docker/daemon.json "/etc/docker/daemon.json.bak-$(date +%Y%m%d-%H%M%S)"
+            log WARN "已有 daemon.json 将被覆盖，旧文件已备份"
+        fi
+
+        printf '{\n  "registry-mirrors": [\n%s\n  ]\n}\n' "$mirrors_json" \
+            | dry tee /etc/docker/daemon.json > /dev/null
+        log INFO "镜像加速写入 /etc/docker/daemon.json ✓"
+
+        dry systemctl restart docker 2>/dev/null || dry service docker restart 2>/dev/null || true
+    fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
