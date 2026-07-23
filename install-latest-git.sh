@@ -170,7 +170,8 @@ log STEP "── 获取最新 Git 版本..."
 
 # Git 使用普通版本标签 v2.x.x，过滤掉 -rc 等预发布
 LATEST_VERSION=$(curl -fsSL "https://api.github.com/repos/git/git/tags?per_page=30" 2>/dev/null \
-    | grep -oP '"name":\s*"v\K[0-9]+\.[0-9]+\.[0-9]+(?=")' \
+    | grep -oP '"name":\s*"v\K[0-9]+\.[0-9]+\.[0-9]+"' \
+    | tr -d '"' \
     | grep -v '\-rc' \
     | head -1)
 
