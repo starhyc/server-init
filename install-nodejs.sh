@@ -144,6 +144,77 @@ else
     log INFO "解压完成 ✓"
 fi
 
+# ── 检测并安装运行时依赖 ─────────────────────────────────────────────────────
+
+_detect_pkg_manager() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "$ID" in
+            ubuntu|debian|raspbian) echo "apt" ;;
+            centos|rhel|rocky|almalinux|ol|fedora|amzn)
+                command -v dnf &>/dev/null && echo "dnf" || echo "yum" ;;
+            opensuse*|sles) echo "zypper" ;;
+            arch|manjaro|endeavouros) echo "pacman" ;;
+            *) echo "unknown" ;;
+        esac
+    elif [ -f /etc/redhat-release ]; then
+        command -v dnf &>/dev/null && echo "dnf" || echo "yum"
+    else
+        echo "unknown"
+    fi
+}
+
+_install_pkg() {
+    case "$PKG_MGR" in
+        apt)    apt-get install -y "$1" ;;
+        dnf)    dnf install -y "$1" ;;
+        yum)    yum install -y "$1" ;;
+        zypper) zypper install -y "$1" ;;
+        pacman) pacman -S --noconfirm "$1" ;;
+    esac
+}
+
+_fix_missing_libs() {
+    # 测试 node 是否能正常加载
+    local err; err=$(LD_LIBRARY_PATH=/usr/local/lib /usr/local/bin/node --version 2>&1) || true
+    [ -z "$err" ] && return 0
+
+    if echo "$err" | grep -q "libatomic"; then
+        log WARN "检测到缺少 libatomic.so.1，正在安装..."
+        case "$PKG_MGR" in
+            apt)    _install_pkg libatomic1 ;;
+            dnf|yum) _install_pkg libatomic ;;
+            zypper) _install_pkg libatomic1 ;;
+            pacman) log INFO "  Arch: libatomic 由 gcc-libs 提供，通常已预装" ;;
+            *)      log WARN "  请手动安装 libatomic (apt: libatomic1 / dnf: libatomic)" ;;
+        esac
+    fi
+
+    if echo "$err" | grep -q "libstdc++"; then
+        log WARN "检测到缺少 libstdc++，正在安装..."
+        case "$PKG_MGR" in
+            apt)    _install_pkg libstdc++6 ;;
+            dnf|yum) _install_pkg libstdc++ ;;
+            zypper) _install_pkg libstdc++6 ;;
+            pacman) log INFO "  Arch: libstdc++ 由 gcc-libs 提供，通常已预装" ;;
+            *)      log WARN "  请手动安装 libstdc++" ;;
+        esac
+    fi
+}
+
+if [ "$DRY_RUN" = false ]; then
+    PKG_MGR=$(_detect_pkg_manager)
+    log INFO "包管理器: ${PKG_MGR}"
+
+    # 确保 /usr/local/lib 在库搜索路径中
+    if ! grep -q '/usr/local/lib' /etc/ld.so.conf.d/*.conf 2>/dev/null; then
+        echo "/usr/local/lib" > /etc/ld.so.conf.d/usr-local.conf
+        ldconfig
+    fi
+
+    _fix_missing_libs
+fi
+
 # ── 验证 ─────────────────────────────────────────────────────────────────────
 
 log STEP "── 验证安装..."
